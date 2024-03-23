@@ -1,0 +1,286 @@
+#! /bin/perl
+use v5.14;
+use strict;
+use warnings;
+use Cwd;
+use File::Spec;
+use File::Temp;
+use IPC::Run qw(run);
+
+sub error {
+  my $message = shift // '';
+  say "$message\n" if $message;
+  die <<EOF
+Usage: tikz2mp4 [OPTION] -l NUM [TEXFILES]
+If texfiles are not specified, read vom STDIN.
+Mandatory arguments:
+  -l NUM[.NUM]    Duration of the video in seconds
+Optonal arguments:
+  -r NUM          Framerate in FPS (defaults to 25)
+  -d NUM          Density im DPI (defaults to 300)
+  -c4             Codec h.264 (default)
+  -c5             Codec h.265
+  -p NUM          Number of parallel processes
+  -P              use the PdfTeX engine
+  -X              use the XeTeX engine
+  -L              use the LuaLaTeX engine (default)
+  -k              keep temporary files
+  -s              keep silent except on serious errors
+  -v              give extensive user feedback on every step
+EOF
+}
+
+sub error_engine { error "You cannot specify more than one Tex engine!" }
+sub error_verbose { error "I cannot be silent and verbose at the same time!"}
+sub error_value { my $o = shift; error "option -$o needs a numeric value!"}
+
+# getopts
+error unless @ARGV;
+our %opt;
+my @texfiles;
+while (@ARGV) {
+  my $arg = shift;
+  if ($arg =~ s/^-//) {
+    while (length $arg) {
+      if    ($arg eq 'l') {$opt{l} = shift or error_value $arg}
+      elsif ($arg eq 'r') {$opt{r} = shift or error_value $arg}
+      elsif ($arg eq 'd') {$opt{d} = shift or error_value $arg}
+      elsif ($arg eq 'p') {$opt{p} = shift or error_value $arg}
+      elsif ($arg =~ /^c/){$opt{c} = substr $arg, 0, 1;
+			   error unless $opt{c} =~ /[4-5]/;
+			   $arg   = substr $arg, 1}
+      elsif ($arg =~ /^P/){$opt{P} = 1;
+			   error_engine if exists $opt{X} || exists $opt{L} }
+      elsif ($arg =~ /^X/){$opt{X} = 1;
+			   error_engine if exists $opt{P} || exists $opt{L} }
+      elsif ($arg =~ /^L/){$opt{L} = 1;
+			   error_engine if exists $opt{X} || exists $opt{P} }
+      elsif ($arg =~ /^k/){$opt{k} = 1}
+      elsif ($arg =~ /^s/){$opt{s} = 1; error_verbose if exists $opt{v} }
+      elsif ($arg =~ /^v/){$opt{v} = 1; error_verbose if exists $opt{s} }
+      elsif ($arg =~ /^h/){ error }
+      else { error "Unknown option -$arg." }
+      $arg = substr $arg, 1;
+    }
+  }
+  else {
+    if (-f $arg) { push @texfiles, $arg }
+    else         { error "$arg: file not found" }
+  }
+}
+# all options must be numeric
+for (keys %opt) {
+  error_value($_) if $opt{$_} =~ /\D/;
+}
+# restore filename to @ARGV
+error "I can handle only one LaTeX-File!" if @texfiles > 1;
+error "Please give me a .tex file"
+  unless not @texfiles or $texfiles[0] =~ /\.tex$/;
+@ARGV = ( $texfiles[0] ) if @texfiles;
+
+# for (keys %opt) {
+#   say "$_: $opt{$_}" if exists $opt{$_}
+# }
+
+# OPTIONS WITH DEFAULT VALUES
+my $duration  = $opt{l} || error "You must specify a duration!";
+my $fps       = $opt{r} || 25;
+my $density   = $opt{d} || 300;
+my $processes = $opt{p} || get_nr_of_cores(); $processes--;
+my $videolib  = (defined $opt{c} and $opt{c} eq '5')
+  ? 'libx265' : 'libx264';
+my $tex_command  =
+    ( $opt{P} ) ? 'pdflatex'
+  : ( $opt{X} ) ? 'xetex'
+  : ( $opt{L} ) ? 'lualatex'  : 'lualatex';
+my $keep      = $opt{k} // 0;
+my $verbose   = $opt{v} // 0;
+my $silent    = $opt{s} // 0;
+
+my $filename = (@ARGV) ? $ARGV[0] =~ s/\.tex//r : 'out';
+
+# Make output directory in /tmp, unless -k
+my $dir     = getcwd();
+my $tempdir = ($keep)
+  ? File::Spec->catdir($dir, 'tik2mp4_tmp')
+  : File::Temp->newdir();
+mkdir($tempdir, 0777) if $keep;
+
+
+# COMMAND NAMES
+my @tex       = ("$tex_command", '-output-directory', "$tempdir", '-jobname');
+my @convert   = ('magick', 'convert', '-background', 'white', '-alpha', 'remove',
+		 '-alpha', 'off', '-density', "$density");
+my @identify  = ('magick', 'identify', '-ping', '-format', "'%h %w'");
+my @mogrify_h = ('magick', 'mogrify', '-chop', '0x1');
+my @mogrify_w = ('magick', 'mogrify', '-chop', '1x0');
+my @ffmpeg    = ('ffmpeg', '-y', '-framerate', "$fps",
+		 '-pattern_type', 'glob', '-i', '*.png',
+		 '-c:v', "$videolib", '-pix_fmt', 'yuv420p');
+
+# compute time values, add to @queue
+my @queue;
+for my $sec (0..int ($duration - 1)) {
+  for my $frac (0..($fps - 1)) {
+    my $time = $frac / $fps + $sec;
+    push @queue, "$time" . "s";
+  }
+}
+push @queue, ( int $duration ) . 's';
+
+# make list of output filenames
+my $width = length scalar @queue;
+my @filenames;
+for my $number  (0..$#queue) {
+  my $format = "%0$width" . "d-$filename";
+  my $name = sprintf $format, $number;
+  push @filenames, "$name";
+}
+
+# get contents of the input tex files, prepare it
+my $buffer = '';
+# TODO: make options safe
+my %check;
+while (<>) {
+  # Skip comments and empty lines
+  next if m/^\s*%/ or m/^\s*$/;
+  # Add the snapshot option to the tikzpicture environment
+  if    ( s! \\begin\{tikzpicture\} \s* \[
+	   !$&make snapshot of = ###, !x
+	) { $check{tikzpicture} = 1 }
+  elsif ( s! \\begin\{tikzpicture\}
+	   !$&\[make snapshot of = ###\]!x
+	) { $check{tikzpicture} = 1 }
+  elsif ( /\\documentclass\{standalone\}/ )
+    {$check{standalone} = 1 }
+  elsif ( /\\usepackage\{tikz\}/ )
+    {$check{tikz} = 1 }
+  elsif ( /\\usetikzlibrary\{animations\}/ )
+    {$check{animations} = 1 }
+  elsif ( /\\begin\{document\}/ )
+    {$check{document} = 1 }
+  elsif ( /\\end\{tikzpicture\}/ )
+    {$check{Tikzpicture} = 1 }
+  elsif ( /\\end\{document\}/ )
+    {$check{Document} = 1 }
+
+  $buffer .= $_;
+}
+
+die "Missing \\begin{tikzpicture}\n" unless $check{tikzpicture};
+die "Missing \\documentclass{standalone}\n" unless $check{standalone};
+die "Missing \\usepackage{tikz}\n" unless $check{tikz};
+die "Missing \\usetikzlibrary{animations}\n" unless $check{animations};
+die "Missing \\begin{document}\n" unless $check{document};
+die "Missing \\end{document}\n" unless $check{Document};
+die "Missing \\end{tikzpicture}\n" unless $check{Tikzpicture};
+
+# divide the queue into queues for each worker process
+my @pid_queue;
+my @queue_indices = (0..$#queue);
+while (@queue_indices) {
+  state $process = 0;
+  my $item = shift @queue_indices;
+  push @{ $pid_queue[$process] }, $item;
+  $process = ($process >= $processes)
+    ? 0 : $process + 1;
+}
+
+# fork
+my $parent_pid = $$;
+my @pid;
+for my $i (0..$processes) {
+  $pid[$i] = fork;
+  unless ( $pid[$i] ) {
+    render_frame($_) for @{ $pid_queue[$i] };
+    exit;
+  }
+}
+
+# Signal handler, if a child process dies: kill all other childs and exit
+$SIG{USR1} = sub {
+  for my $pid (@pid) {
+    kill HUP => $pid;
+    waitpid $pid, 0;
+  }
+  unlink $tempdir unless $keep;
+  die "Exiting..\n"
+};
+
+for my $pid (@pid) {
+  waitpid $pid, 0;
+  say STDERR "Process $pid finished!";
+}
+
+say "Rendering finished sucessfully!" unless $silent;
+
+# RUN FFMPEG in $tempdir
+chdir $tempdir;
+my $output_file = File::Spec->catfile($dir, "$filename.mp4");
+system @ffmpeg, $output_file;
+unless ($keep) {
+  unlink glob "*$filename.*";
+  chdir $dir;
+  unlink $tempdir;
+}
+
+
+# -------------------------------------------------------------------
+# Functions
+
+sub get_nr_of_cores {
+  # WINDOWS
+  for ($^O) {
+    if (/unix/) {
+      open my $handle, "/proc/cpuinfo"
+	or die "Can't open cpuinfo: $!\n";
+      (my $cores = map /^processor/, <$handle>)--;
+      close $handle;
+      return $cores;
+    }
+    # not tested
+    elsif (/win/) {
+      return $ENV{"NUMBER_OF_PROCESSORS"} ;
+    }
+    # not tested
+    elsif (/darwin/) {
+      my @hardinfo = `system_profiler SPHardwareDataType SPSoftwareDataType`;
+      for (@hardinfo) {
+	/^\s+Total Number of Cores\: (.*)$/ and return $1;
+      }
+    }
+    else { return 4 }
+  }
+}
+
+sub child_die {
+  my $msg = shift;
+  chdir $dir; kill USR1 => $parent_pid; die "$msg\n";
+}
+
+sub render_frame {
+  my $frm = shift;
+  say STDERR "Rendering frame for: $queue[$frm]" unless $silent;
+  my $buf = $buffer =~ s/###/$queue[$frm]/gr;
+  print $buf if $verbose;
+  my ($out, $err);
+  # RUN TEX
+  unless ( run [ @tex, $filenames[$frm] ],
+	   \$buf, \$out, \$err ) {
+    child_die "ERROR while processing frame $filenames[$frm]:\n\n $out";
+  }
+
+  # RUN IMAGEMAGICK
+  local *STDERR;
+  open STDERR, '>', $err;
+  my $pdf_file = File::Spec->catfile($tempdir, "$filenames[$frm].pdf");
+  my $png_file = File::Spec->catfile($tempdir, "$filenames[$frm].png");
+  # convert pdf to png; die on non-zero exit value
+  if ( system @convert, $pdf_file, $png_file ) { child_die $err }
+  # chop one row or column of pixels if height or width is odd
+  my ($height, $width) = split ' ', `@identify $png_file`;
+  system @mogrify_h, $png_file if $height % 2;
+  system @mogrify_w, $png_file if $width  % 2;
+}
+
+
